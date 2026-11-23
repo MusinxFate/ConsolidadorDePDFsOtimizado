@@ -1,4 +1,7 @@
 <Solution>
   <Project Path="ConsolidacaoPDFOtimizado/ConsolidacaoPDFOtimizado.csproj" />
+  <Project Path="CopiadorDeConsolidados/CopiadorDeConsolidados.csproj" />
+  <Project Path="CopiadorDePastas/CopiadorDePastas.csproj" />
   <Project Path="Excluir/Excluir.csproj" />
+  <Project Path="SeparadorDePDFs/SeparadorDePDFs.csproj" />
 </Solution>
