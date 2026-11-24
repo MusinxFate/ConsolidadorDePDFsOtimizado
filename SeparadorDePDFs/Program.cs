@@ -8,14 +8,29 @@ internal static class Program
 {
     private const long MaxPdfSizeBytes = (long)(14.5 * 1024 * 1024);
     private const string PartsFolderName = "PDFs partidos";
+    private const string SubfoldersOption = "--subpastas";
     private const string PreferredGhostscriptExecutablePath =
         @"C:\Users\murilo.souza\Downloads\ghostxps-10.07.1-win64\gxpswin64.exe";
+
+    // Preencha com os nomes das pastas cujos PDFs serão verificados.
+    // Use --subpastas ou responda S no prompt para buscar esses nomes em todos os níveis.
+    // Com o array vazio, a pasta informada também é verificada.
+    private static readonly string[] NomesDasPastas =
+    [
+        // "Pasta 1",
+        // "Pasta 2",
+    ];
+
     private static readonly object LogLock = new();
     private static readonly Lazy<string?> GhostscriptExecutablePath = new(FindGhostscriptExecutable);
 
     static void Main(string[] args)
     {
-        var folderPath = GetFolderPath(args);
+        var includeSubfolders = args.Contains(SubfoldersOption, StringComparer.OrdinalIgnoreCase);
+        var pathArgs = args
+            .Where(arg => !arg.Equals(SubfoldersOption, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        var folderPath = GetFolderPath(pathArgs);
 
         if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
         {
@@ -23,8 +38,14 @@ internal static class Program
             return;
         }
 
-        var pdfFiles = Directory
-            .EnumerateFiles(folderPath, "*.pdf", SearchOption.TopDirectoryOnly)
+        if (args.Length == 0)
+        {
+            Console.Write("Verificar subpastas em todos os níveis? (s/N): ");
+            includeSubfolders = string.Equals(Console.ReadLine()?.Trim(), "s", StringComparison.OrdinalIgnoreCase);
+        }
+
+        var pdfFiles = GetFoldersToScan(folderPath, includeSubfolders)
+            .SelectMany(folder => Directory.EnumerateFiles(folder, "*.pdf", SearchOption.TopDirectoryOnly))
             .Where(HasContent)
             .Where(file => !IsGeneratedPart(file))
             .OrderBy(file => file)
@@ -32,7 +53,7 @@ internal static class Program
 
         if (pdfFiles.Length == 0)
         {
-            Log("Nenhum PDF encontrado na pasta informada.");
+            Log("Nenhum PDF encontrado nas pastas selecionadas.");
             return;
         }
 
@@ -45,6 +66,48 @@ internal static class Program
         }
 
         Log("Finalizado.");
+    }
+
+    private static IEnumerable<string> GetFoldersToScan(string folderPath, bool includeSubfolders)
+    {
+        var selectedNames = new HashSet<string>(NomesDasPastas, StringComparer.OrdinalIgnoreCase);
+        if (selectedNames.Count == 0)
+        {
+            yield return folderPath;
+            if (!includeSubfolders)
+            {
+                yield break;
+            }
+        }
+
+        var enumerationOptions = new EnumerationOptions
+        {
+            AttributesToSkip = FileAttributes.ReparsePoint,
+            IgnoreInaccessible = false
+        };
+        var pendingFolders = new Stack<DirectoryInfo>();
+        pendingFolders.Push(new DirectoryInfo(folderPath));
+
+        while (pendingFolders.TryPop(out var folder))
+        {
+            foreach (var subfolder in folder.EnumerateDirectories("*", enumerationOptions))
+            {
+                if (subfolder.Name.Equals(PartsFolderName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (selectedNames.Count == 0 || selectedNames.Contains(subfolder.Name))
+                {
+                    yield return subfolder.FullName;
+                }
+
+                if (includeSubfolders)
+                {
+                    pendingFolders.Push(subfolder);
+                }
+            }
+        }
     }
 
     private static string? GetFolderPath(string[] args)
