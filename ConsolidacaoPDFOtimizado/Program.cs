@@ -1,8 +1,11 @@
 ﻿using PdfSharp.Pdf;
 using PdfSharp.Pdf.IO;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
+using System.Text;
 
 [assembly: SupportedOSPlatform("windows")]
 
@@ -10,19 +13,10 @@ namespace ConsolidacaoDePDFs
 {
     internal class Program
     {
-        private static readonly string LogFolderPath = @"C:\Users\murilo.souza\Desktop\Testes - Decadencia\Logs\";
-        private static readonly string LogPath = $@"{LogFolderPath}consolidacao_log_infos.txt";
-
-        private static readonly string LogNaoEncontrouPastaPath =
-            $@"{LogFolderPath}consolidacao_log_existe_excel_nao_existe_pasta.txt";
-
-        private static readonly string LogNaoEncontradoExcelPath =
-            $@"{LogFolderPath}consolidacao_log_existe_pasta_nao_existe_no_excel.txt";
-
-        private static readonly string LogPastasVaziasPath = $@"{LogFolderPath}consolidacao_log_pastas_vazias.txt";
-        private static readonly string LogJaExisteConsolidacao = $@"{LogFolderPath}consolidacao_log_ja_consolidado.txt";
+        private static string LogFolderPath = @"C:\Users\murilo.souza\Desktop\Testes - Decadencia\Logs\";
+        private const string PendingPublicationName = ".consolidacao-pendente";
+        private const string PublicationTempPrefix = ".consolidacao-";
         private static readonly object _lock = new object();
-        private static readonly object _wordLock = new object();
         private const long MaxConsolidatedPdfSizeBytes = (long)(14.5 * 1024 * 1024);
 
         private const string GhostscriptMissingLogMessage =
@@ -35,10 +29,51 @@ namespace ConsolidacaoDePDFs
         //@"C:\Users\murilo.souza\Desktop\Testes - Decadencia\Fazer";
         @"\\SRV-FS02-BBM\Empresas$\Empresas\VIA VAREJO (GRUPO CASAS BAHIA)\1. CONTROLE\7. REVISÃO DA CP NAS RTS\13. PAFs\19613.7393632022-72 - 6ª COMPENSAÇÃO 07.2022\BOOK";
 
-        static void Main(string[] args)
+        static int Main(string[] args)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            var dividirPdfsPorTamanho = DeveDividirPdfsPorTamanho();
+            var basePath = BasePath;
+            string? destination = null;
+            int? requestedParallelism = null;
+            var copyInputs = false;
+
+            foreach (var argument in args)
+            {
+                if (argument == "--copiar-entradas")
+                    copyInputs = true;
+                else if (argument.StartsWith("--paralelismo=") &&
+                         int.TryParse(argument["--paralelismo=".Length..], out var value) && value > 0)
+                    requestedParallelism = value;
+                else if (argument.StartsWith("--pasta=") && argument.Length > "--pasta=".Length)
+                    basePath = argument["--pasta=".Length..];
+                else if (argument.StartsWith("--logs=") && argument.Length > "--logs=".Length)
+                    LogFolderPath = argument["--logs=".Length..];
+                else if (argument.StartsWith("--destino=") &&
+                         !string.IsNullOrWhiteSpace(argument["--destino=".Length..]))
+                    destination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(argument["--destino=".Length..]));
+                else
+                {
+                    Console.Error.WriteLine($"Argumento inválido: {argument}");
+                    Console.Error.WriteLine("Uso: [--paralelismo=N] [--copiar-entradas] [--pasta=CAMINHO] [--logs=CAMINHO] [--destino=CAMINHO]");
+                    return 1;
+                }
+            }
+
+            if (Console.IsInputRedirected)
+                Console.InputEncoding = Encoding.UTF8;
+
+            if (ReadYesNo("Deseja dividir os PDFs consolidados com base no tamanho? (S/N): ")
+                is not bool dividirPdfsPorTamanho)
+            {
+                Console.Error.WriteLine("Entrada encerrada antes da escolha sobre a divisão dos PDFs.");
+                return 1;
+            }
+
+            destination ??= ReadDestination();
+            var parallelism = requestedParallelism ?? ReadParallelism(Math.Min(6, Environment.ProcessorCount));
+            copyInputs = copyInputs || ReadYesNo("Deseja copiar os PDFs de entrada para o disco local? (S/N) [N]: ", false) == true;
+
+            var sw = Stopwatch.StartNew();
+            Directory.CreateDirectory(LogFolderPath);
 
             Log(dividirPdfsPorTamanho
                 ? "Divisão dos PDFs por tamanho: SIM"
@@ -48,7 +83,8 @@ namespace ConsolidacaoDePDFs
 
             var nomesSet = new HashSet<string>(nomes);
 
-            var folders = Directory.GetDirectories(BasePath);
+            Log($"Pastas simultâneas: {parallelism}; cópia local dos PDFs de entrada: {(copyInputs ? "SIM" : "NÃO")}");
+            var folders = Directory.EnumerateDirectories(Path.GetFullPath(basePath));
 
             var matchingFolders = new List<string>();
             var encontrados = new HashSet<string>();
@@ -58,6 +94,17 @@ namespace ConsolidacaoDePDFs
             foreach (var folder in folders)
             {
                 var folderName = Path.GetFileName(folder);
+                if (string.Equals(folder, destination, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (nomesSet.Contains(folderName))
+                    {
+                        Console.Error.WriteLine($"O destino deve ser diferente da pasta de entrada: {folder}");
+                        return 1;
+                    }
+
+                    continue;
+                }
+
                 nomesPastas.Add(folderName);
 
                 if (nomesSet.Contains(folderName))
@@ -67,17 +114,23 @@ namespace ConsolidacaoDePDFs
                 }
             }
 
+            if (destination is not null)
+            {
+                Directory.CreateDirectory(destination);
+                Log($"Destino dos PDFs consolidados: {destination}");
+            }
+
             var naoEncontrados = nomesSet
                 .Where(n => !encontrados.Contains(n))
                 .ToList();
 
-            File.WriteAllLines(LogNaoEncontrouPastaPath, naoEncontrados);
+            File.WriteAllLines(Path.Combine(LogFolderPath, "consolidacao_log_existe_excel_nao_existe_pasta.txt"), naoEncontrados);
 
             var pastasNaoNaLista = nomesPastas
                 .Where(nome => !nomesSet.Contains(nome))
                 .ToList();
 
-            File.WriteAllLines(LogNaoEncontradoExcelPath, pastasNaoNaLista);
+            File.WriteAllLines(Path.Combine(LogFolderPath, "consolidacao_log_existe_pasta_nao_existe_no_excel.txt"), pastasNaoNaLista);
 
             Log($"Pastas para processar: {matchingFolders.Count}");
             Log($"Não encontrados: {naoEncontrados.Count}");
@@ -85,144 +138,386 @@ namespace ConsolidacaoDePDFs
 
             var options = new ParallelOptions
             {
-                MaxDegreeOfParallelism = Environment.ProcessorCount
+                MaxDegreeOfParallelism = parallelism
             };
 
-            Parallel.ForEach(
-                matchingFolders,
-                options,
-                folder => ProcessFolder(folder, dividirPdfsPorTamanho));
+            using (var word = new WordConverter())
+            {
+                Parallel.ForEach(matchingFolders, options,
+                    folder => ProcessFolder(folder, destination, dividirPdfsPorTamanho, copyInputs, word));
+            }
 
             sw.Stop();
             Log($"FINALIZADO em {sw.Elapsed}");
+            return 0;
         }
 
-        static bool DeveDividirPdfsPorTamanho()
+        static bool? ReadYesNo(string prompt, bool? defaultAnswer = null)
         {
             while (true)
             {
-                Console.Write("Deseja dividir os PDFs consolidados com base no tamanho? (S/N): ");
-                var resposta = Console.ReadLine()?.Trim();
+                Console.Write(prompt);
+                var answer = Console.ReadLine()?.Trim();
+                if (answer is null || (answer.Length == 0 && defaultAnswer.HasValue))
+                    return defaultAnswer;
 
-                if (resposta?.Equals("S", StringComparison.OrdinalIgnoreCase) == true)
-                {
+                if (answer.Equals("S", StringComparison.OrdinalIgnoreCase))
                     return true;
-                }
 
-                if (resposta?.Equals("N", StringComparison.OrdinalIgnoreCase) == true)
-                {
+                if (answer.Equals("N", StringComparison.OrdinalIgnoreCase))
                     return false;
-                }
 
                 Console.WriteLine("Opção inválida. Digite S para sim ou N para não.");
             }
         }
 
-        static void ProcessFolder(string folder, bool dividirPdfsPorTamanho)
+        static string? ReadDestination()
         {
+            while (true)
+            {
+                Console.Write("Pasta única para salvar os consolidados [Enter para usar as pastas de origem]: ");
+                var path = Console.ReadLine()?.Trim();
+                if (string.IsNullOrEmpty(path))
+                    return null;
+
+                try
+                {
+                    if (path.Length >= 2 && path[0] == '"' && path[^1] == '"')
+                        path = path[1..^1];
+
+                    return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+                }
+                catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+                {
+                    Console.WriteLine($"Caminho inválido. {ex.Message}");
+                }
+            }
+        }
+
+        static int ReadParallelism(int defaultParallelism)
+        {
+            while (true)
+            {
+                Console.Write($"Quantas pastas deseja processar simultaneamente? [{defaultParallelism}]: ");
+                var answer = Console.ReadLine()?.Trim();
+                if (string.IsNullOrEmpty(answer))
+                    return defaultParallelism;
+
+                if (int.TryParse(answer, out var parallelism) && parallelism > 0)
+                    return parallelism;
+
+                Console.WriteLine("Digite um número inteiro maior que zero.");
+            }
+        }
+
+        static void ProcessFolder(string folder, string? destination, bool dividirPdfsPorTamanho, bool copyInputs,
+            WordConverter word)
+        {
+            DirectoryInfo? workDirectory = null;
+
             try
             {
+                var timer = Stopwatch.StartNew();
                 var folderName = Path.GetFileName(folder);
-                var outputPath = Path.Combine(folder, $"RT {folderName}.pdf");
+                var outputFolder = destination ?? folder;
+                var outputName = $"RT {folderName}.pdf";
+                var outputPath = Path.Combine(outputFolder, outputName);
+                var tempPrefix = destination is null ? PublicationTempPrefix : GetPublicationTempPrefix(outputName);
+                var pendingName = destination is null ? PendingPublicationName : $"{tempPrefix}pendente";
+                var lockName = destination is null ? ".consolidacao.lock" : $"{tempPrefix}lock";
+                var outputFiles = ReadOutputFiles(outputFolder, folderName, pendingName, tempPrefix, destination is not null);
+                var listTime = timer.Elapsed;
 
-                if (File.Exists(outputPath))
+                var existingPdf = FindFile(outputFiles, outputName);
+                var hasPendingPublication = FindFile(outputFiles, pendingName) is not null;
+                var staleUploads = outputFiles.Where(file => IsPublicationTemporaryFile(file.Name, tempPrefix)).ToArray();
+                var hasInterruptedWork = hasPendingPublication || staleUploads.Length > 0;
+                if (!hasInterruptedWork && existingPdf is not null &&
+                    (!dividirPdfsPorTamanho || existingPdf.Length <= MaxConsolidatedPdfSizeBytes))
                 {
-                    if (dividirPdfsPorTamanho)
-                    {
-                        SplitPdfIfNeeded(outputPath);
-                    }
-
                     Log($"[SKIP] {folderName}");
-                    LogJaExisteConsolidacao_($"{folderName}");
+                    LogJaExisteConsolidacao_(folderName);
                     return;
                 }
 
-                if (HasConsolidatedParts(folder, folderName))
+                var parts = existingPdf is null ? GetConsolidatedParts(outputFiles, folderName) : [];
+                var pendingPath = Path.Combine(outputFolder, pendingName);
+                if (!hasInterruptedWork && parts.Length > 0 &&
+                    (!dividirPdfsPorTamanho || parts.All(part => part.Length <= MaxConsolidatedPdfSizeBytes)) &&
+                    !File.Exists(pendingPath))
+                {
+                    Log($"[SKIP PARTS] {folderName}");
+                    LogJaExisteConsolidacao_(folderName);
+                    return;
+                }
+
+                FileInfo[]? files = destination is null ? outputFiles : null;
+                if (!hasInterruptedWork && existingPdf is null && parts.Length == 0)
+                {
+                    files ??= ReadFolder(folder);
+                    listTime = timer.Elapsed;
+                    if (!files.Any(file => file.Length > 0 && IsInputFile(file, folderName)))
+                    {
+                        Log($"[EMPTY] {folderName}");
+                        LogPastasVazias(folderName);
+                        return;
+                    }
+                }
+
+                using var folderLock = new FileStream(Path.Combine(outputFolder, lockName),
+                    FileMode.OpenOrCreate, FileAccess.Write, FileShare.None, 1, FileOptions.DeleteOnClose);
+
+                foreach (var upload in staleUploads)
+                    DeleteTemporaryFile(upload.FullName);
+
+                var pendingPublicationStillExists = File.Exists(pendingPath);
+                if (pendingPublicationStillExists)
+                    RecoverPendingPublication(outputFolder, folderName, pendingPath);
+
+                if (hasInterruptedWork || pendingPublicationStillExists)
+                {
+                    outputFiles = ReadOutputFiles(outputFolder, folderName, pendingName, tempPrefix, destination is not null);
+                    if (destination is null)
+                        files = outputFiles;
+
+                    existingPdf = FindFile(outputFiles, outputName);
+                    parts = existingPdf is null ? GetConsolidatedParts(outputFiles, folderName) : [];
+                    listTime = timer.Elapsed;
+                }
+
+                workDirectory = Directory.CreateTempSubdirectory("consolidacao-pdf-");
+                var workPath = workDirectory.FullName;
+                var splitTime = TimeSpan.Zero;
+                var publishTime = TimeSpan.Zero;
+
+                if (existingPdf is not null)
+                {
+                    if (dividirPdfsPorTamanho && existingPdf.Length > MaxConsolidatedPdfSizeBytes)
+                        SplitExistingPdf(existingPdf, workPath, tempPrefix, ref splitTime, ref publishTime);
+
+                    Log($"[SKIP] {folderName} | listagem {listTime.TotalSeconds:F2}s | divisão {splitTime.TotalSeconds:F2}s | publicação {publishTime.TotalSeconds:F2}s");
+                    LogJaExisteConsolidacao_(folderName);
+                    return;
+                }
+
+                if (parts.Length > 0)
                 {
                     if (dividirPdfsPorTamanho)
                     {
-                        SplitExistingConsolidatedParts(folder, folderName);
+                        foreach (var part in parts.Where(file => file.Length > MaxConsolidatedPdfSizeBytes))
+                            SplitExistingPdf(part, workPath, tempPrefix, ref splitTime, ref publishTime);
                     }
 
-                    Log($"[SKIP PARTS] {folderName}");
-                    LogJaExisteConsolidacao_($"{folderName}");
+                    Log($"[SKIP PARTS] {folderName} | listagem {listTime.TotalSeconds:F2}s | divisão {splitTime.TotalSeconds:F2}s | publicação {publishTime.TotalSeconds:F2}s");
+                    LogJaExisteConsolidacao_(folderName);
                     return;
                 }
 
-                ConvertDocFilesToPdf(folder);
+                if (File.Exists(outputPath) || File.Exists(Path.Combine(outputFolder, GetPartName(outputName, 1))))
+                {
+                    Log($"[SKIP CONCORRENTE] {folderName}");
+                    LogJaExisteConsolidacao_(folderName);
+                    return;
+                }
 
-                var files = Directory
-                    .EnumerateFiles(folder, "*.pdf", SearchOption.TopDirectoryOnly)
-                    .Where(HasContent)
-                    .Where(f => !IsConsolidatedPdf(f, folderName))
-                    .OrderBy(f => f)
+                if (files is null)
+                {
+                    files = ReadFolder(folder);
+                    listTime = timer.Elapsed;
+                }
+
+                var phase = Stopwatch.StartNew();
+                var converted = ConvertDocFilesToPdf(folder, folderName, files, workPath, word,
+                    publishToSource: destination is null);
+                var wordTime = phase.Elapsed;
+                var inputs = files.Concat(converted)
+                    .Where(file => IsPdf(file) && file.Length > 0 && !IsConsolidatedPdf(file.Name, folderName))
+                    .OrderBy(file => file.Name)
                     .ToArray();
 
-                if (files.Length == 0)
+                if (inputs.Length == 0)
                 {
                     Log($"[EMPTY] {folderName}");
                     LogPastasVazias(folderName);
                     return;
                 }
 
-                using var outPdf = new PdfDocument();
-                ConfigurePdfOptions(outPdf);
-
-                foreach (var file in files)
+                phase.Restart();
+                var localOutput = Path.Combine(workPath, outputName);
+                var localInput = copyInputs ? Path.Combine(workPath, "entrada.tmp") : null;
+                using (var output = CreatePdfDocument())
                 {
-                    TryAppendPdf(file, outPdf);
-                }
-
-                if (outPdf.PageCount > 0)
-                {
-                    outPdf.Save(outputPath);
-
-                    if (dividirPdfsPorTamanho)
+                    foreach (var input in inputs)
                     {
-                        SplitPdfIfNeeded(outputPath);
+                        var isSourceInput = string.Equals(input.DirectoryName, folder, StringComparison.OrdinalIgnoreCase);
+                        TryAppendPdf(input.FullName, isSourceInput ? localInput : null, output);
                     }
 
-                    Log($"[OK] {folderName}");
+                    if (output.PageCount == 0)
+                    {
+                        Log($"[NO PAGES] {folderName}");
+                        return;
+                    }
+
+                    output.Save(localOutput);
                 }
-                else
+
+                var mergeTime = phase.Elapsed;
+                phase.Restart();
+                var filesToPublish = new List<string> { localOutput };
+                if (dividirPdfsPorTamanho && GetFileSize(localOutput) > MaxConsolidatedPdfSizeBytes)
                 {
-                    Log($"[NO PAGES] {folderName}");
+                    var split = SplitPdf(localOutput, outputPath);
+                    if (split.FitsLimit)
+                        filesToPublish.Clear();
+
+                    filesToPublish.AddRange(split.Parts);
                 }
+
+                splitTime = phase.Elapsed;
+                phase.Restart();
+                var journal = filesToPublish.Count > 1 && filesToPublish[0] != localOutput ? pendingPath : null;
+                PublishFiles(filesToPublish, outputFolder, overwrite: false, journal, tempPrefix);
+                publishTime = phase.Elapsed;
+                Log($"[OK] {folderName} | {inputs.Length} PDFs | listagem {listTime.TotalSeconds:F2}s | Word {wordTime.TotalSeconds:F2}s | consolidação {mergeTime.TotalSeconds:F2}s | divisão {splitTime.TotalSeconds:F2}s | publicação {publishTime.TotalSeconds:F2}s");
             }
             catch (Exception ex)
             {
                 Log($"[ERRO PASTA] {folder} => {ex.Message}");
             }
+            finally
+            {
+                if (workDirectory is not null)
+                {
+                    try
+                    {
+                        workDirectory.Delete(recursive: true);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        Log($"[ERRO TEMPORÁRIO] {workDirectory.FullName} => {ex.Message}");
+                    }
+                }
+            }
         }
 
-        static void ConvertDocFilesToPdf(string folder)
+        static FileInfo[] ReadFolder(string folder)
         {
-            var docFiles = Directory
-                .EnumerateFiles(folder, "*.doc", SearchOption.TopDirectoryOnly)
-                .Concat(Directory.EnumerateFiles(folder, "*.docx", SearchOption.TopDirectoryOnly))
-                .Where(IsWordDocument)
-                .Where(HasContent)
-                .Where(f => !File.Exists(Path.ChangeExtension(f, ".pdf")))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(f => f)
+            return new DirectoryInfo(folder).EnumerateFiles()
+                .Where(file => IsPdf(file) || IsWordDocument(file.Name) || file.Name == PendingPublicationName ||
+                               IsPublicationTemporaryFile(file.Name))
+                .ToArray();
+        }
+
+        static FileInfo[] ReadOutputFiles(string folder, string folderName, string pendingName, string tempPrefix,
+            bool sharedDestination)
+        {
+            if (!sharedDestination)
+                return ReadFolder(folder);
+
+            var directory = new DirectoryInfo(folder);
+            return directory.EnumerateFiles($"RT {folderName}*").Where(IsPdf)
+                .Concat(directory.EnumerateFiles($"{tempPrefix}*")
+                    .Where(file => file.Name == pendingName || IsPublicationTemporaryFile(file.Name, tempPrefix)))
+                .ToArray();
+        }
+
+        static string GetPublicationTempPrefix(string outputName)
+        {
+            var hash = SHA256.HashData(Encoding.UTF8.GetBytes(outputName.ToUpperInvariant()));
+            return $"{PublicationTempPrefix}{Convert.ToHexString(hash)}-";
+        }
+
+        static bool IsPublicationTemporaryFile(string name, string tempPrefix = PublicationTempPrefix)
+        {
+            return name.Length == tempPrefix.Length + 36 &&
+                   name.StartsWith(tempPrefix, StringComparison.Ordinal) &&
+                   name.EndsWith(".tmp", StringComparison.Ordinal) &&
+                   Guid.TryParseExact(name.AsSpan(tempPrefix.Length, 32), "N", out _);
+        }
+
+        static FileInfo? FindFile(FileInfo[] files, string name)
+        {
+            return files.FirstOrDefault(file => file.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        static bool IsPdf(FileInfo file)
+        {
+            return file.Extension.Equals(".pdf", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool IsInputFile(FileInfo file, string folderName)
+        {
+            return IsWordDocument(file.Name) ||
+                   (IsPdf(file) && !IsConsolidatedPdf(file.Name, folderName));
+        }
+
+        static IReadOnlyList<FileInfo> ConvertDocFilesToPdf(string folder, string folderName, FileInfo[] files,
+            string workPath, WordConverter word, bool publishToSource)
+        {
+            var documents = files
+                .Where(file => IsWordDocument(file.Name) && !IsConsolidatedPdf(file.Name, folderName) && file.Length > 0)
+                .OrderBy(file => file.Name)
                 .ToArray();
 
-            if (docFiles.Length == 0)
-            {
-                return;
-            }
+            if (documents.Length == 0)
+                return [];
 
+            var pdfNames = files.Where(IsPdf).Select(file => file.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var toConvert = documents.Where(file => !pdfNames.Contains(Path.ChangeExtension(file.Name, ".pdf"))).ToArray();
+            if (toConvert.Length == 0)
+                return [];
+
+            var localWordPath = Directory.CreateDirectory(Path.Combine(workPath, "word")).FullName;
+            var exported = new List<(string Source, string Output)>();
             try
             {
-                lock (_wordLock)
+                word.Run(application =>
                 {
-                    RunOnStaThread(() => ConvertDocumentsToPdfWithWord(docFiles));
-                }
+                    foreach (var file in toConvert)
+                    {
+                        var pdfName = Path.ChangeExtension(file.Name, ".pdf");
+                        if (pdfNames.Contains(pdfName))
+                            continue;
+
+                        var localPdf = Path.Combine(localWordPath, pdfName);
+
+                        try
+                        {
+                            ExportDocumentToPdf(application, file.FullName, localPdf);
+                            pdfNames.Add(pdfName);
+                            exported.Add((file.FullName, localPdf));
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"[ERRO DOC] {file.FullName} => {ex.Message}");
+                            DeleteTemporaryFile(localPdf);
+                        }
+                    }
+                });
             }
             catch (Exception ex)
             {
                 Log($"[ERRO WORD] {folder} => {ex.Message}");
             }
+
+            var converted = new List<FileInfo>(exported.Count);
+            foreach (var (source, localPdf) in exported)
+            {
+                try
+                {
+                    if (publishToSource)
+                        PublishFiles(new[] { localPdf }, folder, overwrite: false);
+                    converted.Add(new FileInfo(localPdf));
+                    Log($"[DOC->PDF] {source}");
+                }
+                catch (Exception ex)
+                {
+                    Log($"[ERRO DOC] {source} => {ex.Message}");
+                }
+            }
+
+            return converted;
         }
 
         static bool IsWordDocument(string file)
@@ -232,168 +527,283 @@ namespace ConsolidacaoDePDFs
                    || extension.Equals(".docx", StringComparison.OrdinalIgnoreCase);
         }
 
-        static bool HasContent(string file)
+        static void ExportDocumentToPdf(dynamic word, string docPath, string pdfPath)
         {
-            try
-            {
-                return GetFileSize(file) > 0;
-            }
-            catch (Exception ex)
-            {
-                Log($"[ERRO TAMANHO] {file} => {ex.Message}");
-                return false;
-            }
-        }
-
-        static void ConvertDocumentsToPdfWithWord(string[] docFiles)
-        {
-            object? wordApplication = null;
+            object? documents = null;
+            object? document = null;
 
             try
             {
-                var wordType = Type.GetTypeFromProgID("Word.Application")
-                               ?? throw new InvalidOperationException(
-                                   "Microsoft Word não está instalado ou não está registrado para automação COM.");
-
-                wordApplication = Activator.CreateInstance(wordType)
-                                  ?? throw new InvalidOperationException("Não foi possível iniciar o Microsoft Word.");
-
-                dynamic word = wordApplication;
-                word.Visible = false;
-                word.DisplayAlerts = 0;
-
-                foreach (var docPath in docFiles)
-                {
-                    object? document = null;
-                    var pdfPath = Path.ChangeExtension(docPath, ".pdf");
-
-                    try
-                    {
-                        document = word.Documents.Open(
-                            FileName: docPath,
-                            ConfirmConversions: false,
-                            ReadOnly: true,
-                            AddToRecentFiles: false,
-                            Visible: false);
-
-                        dynamic doc = document;
-                        doc.SaveAs2(FileName: pdfPath, FileFormat: 17);
-                        doc.Close(SaveChanges: false);
-                        document = null;
-
-                        Log($"[DOC->PDF] {docPath}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"[ERRO DOC] {docPath} => {ex.Message}");
-                    }
-                    finally
-                    {
-                        ReleaseComObject(document);
-                    }
-                }
-
-                word.Quit(SaveChanges: false);
-                wordApplication = null;
+                documents = word.Documents;
+                document = ((dynamic)documents).Open(
+                    FileName: docPath,
+                    ConfirmConversions: false,
+                    ReadOnly: true,
+                    AddToRecentFiles: false,
+                    Visible: false);
+                ((dynamic)document).SaveAs2(FileName: pdfPath, FileFormat: 17);
             }
             finally
             {
-                ReleaseComObject(wordApplication);
-            }
-        }
-
-        static void RunOnStaThread(Action action)
-        {
-            Exception? exception = null;
-
-            var thread = new Thread(() =>
-            {
                 try
                 {
-                    action();
+                    if (document is not null)
+                        ((dynamic)document).Close(SaveChanges: false);
                 }
-                catch (Exception ex)
+                finally
                 {
-                    exception = ex;
+                    ReleaseComObject(document);
+                    ReleaseComObject(documents);
                 }
-            });
-
-            thread.SetApartmentState(ApartmentState.STA);
-            thread.Start();
-            thread.Join();
-
-            if (exception is not null)
-            {
-                throw exception;
             }
         }
 
-        static void SplitPdfIfNeeded(string pdfPath)
+        private sealed class WordConverter : IDisposable
         {
-            if (!File.Exists(pdfPath))
+            private readonly BlockingCollection<(Action<object> Convert, TaskCompletionSource Completed)> _jobs = new();
+            private readonly Lazy<Thread> _thread;
+
+            public WordConverter()
             {
+                _thread = new Lazy<Thread>(() =>
+                {
+                    var thread = new Thread(ProcessJobs);
+                    thread.SetApartmentState(ApartmentState.STA);
+                    thread.Start();
+                    return thread;
+                });
+            }
+
+            public void Run(Action<object> convert)
+            {
+                var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _ = _thread.Value;
+                _jobs.Add((convert, completed));
+                completed.Task.GetAwaiter().GetResult();
+            }
+
+            private void ProcessJobs()
+            {
+                object? application = null;
+
+                try
+                {
+                    foreach (var (convert, completed) in _jobs.GetConsumingEnumerable())
+                    {
+                        try
+                        {
+                            if (application is null)
+                            {
+                                var wordType = Type.GetTypeFromProgID("Word.Application")
+                                               ?? throw new InvalidOperationException("Microsoft Word indisponível para automação COM.");
+                                application = Activator.CreateInstance(wordType)
+                                              ?? throw new InvalidOperationException("Não foi possível iniciar o Microsoft Word.");
+                                ((dynamic)application).Visible = false;
+                                ((dynamic)application).DisplayAlerts = 0;
+                            }
+
+                            convert(application);
+                            completed.SetResult();
+                        }
+                        catch (Exception ex)
+                        {
+                            completed.SetException(ex);
+                        }
+                    }
+                }
+                finally
+                {
+                    if (application is not null)
+                    {
+                        try
+                        {
+                            ((dynamic)application).Quit(SaveChanges: false);
+                        }
+                        catch (COMException ex)
+                        {
+                            Log($"[ERRO WORD] Encerramento => {ex.Message}");
+                        }
+                        finally
+                        {
+                            ReleaseComObject(application);
+                        }
+                    }
+                }
+            }
+
+            public void Dispose()
+            {
+                _jobs.CompleteAdding();
+                if (_thread.IsValueCreated)
+                    _thread.Value.Join();
+
+                _jobs.Dispose();
+            }
+        }
+
+        static void SplitExistingPdf(FileInfo source, string workPath, string tempPrefix, ref TimeSpan splitTime,
+            ref TimeSpan publishTime)
+        {
+            var timer = Stopwatch.StartNew();
+            var splitDirectory = Directory.CreateDirectory(Path.Combine(workPath, Guid.NewGuid().ToString("N")));
+            var localSource = Path.Combine(splitDirectory.FullName, source.Name);
+
+            if (!File.Exists(source.FullName))
                 return;
-            }
 
-            if (GetFileSize(pdfPath) <= MaxConsolidatedPdfSizeBytes)
-            {
+            CopyToLocal(source.FullName, localSource);
+
+            if (GetFileSize(localSource) <= MaxConsolidatedPdfSizeBytes)
                 return;
-            }
 
-            int pageCount;
-            using (var input = OpenWithRetry(pdfPath))
-            {
-                pageCount = input.PageCount;
-            }
+            var split = SplitPdf(localSource, source.FullName);
+            splitTime += timer.Elapsed;
+            timer.Restart();
 
-            var partNumber = 1;
-            var createdParts = new List<string>();
+            PublishFiles(split.Parts, source.DirectoryName!, overwrite: true, tempPrefix: tempPrefix);
+            if (split.FitsLimit)
+                File.Delete(source.FullName);
+
+            publishTime += timer.Elapsed;
+        }
+
+        static (List<string> Parts, bool FitsLimit) SplitPdf(string localPdfPath, string destinationPath)
+        {
+            using var input = OpenWithRetry(localPdfPath);
+
+            if (input.PageCount == 0)
+                throw new InvalidDataException($"O PDF não tem páginas: {destinationPath}");
+
+            var localDirectory = Path.GetDirectoryName(localPdfPath)!;
+            var candidatePath = Path.Combine(localDirectory, "intervalo.tmp");
+            var originalName = Path.GetFileName(localPdfPath);
+            var parts = new List<string>();
+            var fitsLimit = true;
             var startPageIndex = 0;
 
-            while (startPageIndex < pageCount)
+            while (startPageIndex < input.PageCount)
             {
-                var endPageIndex = FindLargestPageRangeEnd(pdfPath, startPageIndex, pageCount - 1);
+                var partName = GetPartName(originalName, parts.Count + 1);
+                var partPath = Path.Combine(localDirectory, partName);
+                var rangeEnd = FindLargestPageRangeEnd(input, startPageIndex, candidatePath, partPath);
 
-                if (endPageIndex >= startPageIndex)
+                if (rangeEnd < startPageIndex)
                 {
-                    var partPath = GetPartPath(pdfPath, partNumber++);
-                    SavePageRange(pdfPath, startPageIndex, endPageIndex, partPath);
-                    createdParts.Add(partPath);
-                    startPageIndex = endPageIndex + 1;
-                    continue;
+                    File.Move(candidatePath, partPath, overwrite: true);
+                    if (!TryCompressPdfToLimit(partPath))
+                    {
+                        fitsLimit = false;
+                        Log($"[SPLIT ERRO LIMITE] {destinationPath} | página {startPageIndex + 1} | {partName} ({FormatSize(GetFileSize(partPath))})");
+                    }
+
+                    rangeEnd = startPageIndex;
                 }
 
-                var oversizedSinglePagePath = GetPartPath(pdfPath, partNumber++);
-                SavePageRange(pdfPath, startPageIndex, startPageIndex, oversizedSinglePagePath);
-                TryCompressPdfToLimit(oversizedSinglePagePath);
-                createdParts.Add(oversizedSinglePagePath);
-                Log(
-                    $"[SPLIT WARN] Página {startPageIndex + 1} sozinha ficou acima de 14,5 MB: {oversizedSinglePagePath} ({FormatSize(GetFileSize(oversizedSinglePagePath))})");
-                startPageIndex++;
+                parts.Add(partPath);
+                startPageIndex = rangeEnd + 1;
             }
 
-            var oversizedParts = createdParts
-                .Where(part => GetFileSize(part) > MaxConsolidatedPdfSizeBytes)
-                .ToArray();
+            Log($"[SPLIT] {destinationPath} => {parts.Count} partes");
+            return (parts, fitsLimit);
+        }
 
-            foreach (var oversizedPart in oversizedParts)
+        static void PublishFiles(IReadOnlyList<string> localFiles, string folder, bool overwrite,
+            string? journalPath = null, string tempPrefix = PublicationTempPrefix)
+        {
+            var staged = new List<(string TempPath, string Destination)>(localFiles.Count);
+            var published = new List<string>(localFiles.Count);
+            string? journalTempPath = null;
+            var journalCreated = false;
+
+            try
             {
-                TryCompressPdfToLimit(oversizedPart);
+                foreach (var localFile in localFiles)
+                {
+                    var destination = Path.Combine(folder, Path.GetFileName(localFile));
+                    var tempPath = Path.Combine(folder, $"{tempPrefix}{Guid.NewGuid():N}.tmp");
+                    staged.Add((tempPath, destination));
+                    File.Copy(localFile, tempPath);
+                }
+
+                if (journalPath is not null)
+                {
+                    foreach (var (_, destination) in staged)
+                    {
+                        if (File.Exists(destination))
+                            throw new IOException($"O arquivo já existe: {destination}");
+                    }
+
+                    journalTempPath = Path.Combine(folder, $"{tempPrefix}{Guid.NewGuid():N}.tmp");
+                    File.WriteAllLines(journalTempPath, staged.Select(file => Path.GetFileName(file.Destination)));
+                    File.Move(journalTempPath, journalPath);
+                    journalTempPath = null;
+                    journalCreated = true;
+                }
+
+                foreach (var (tempPath, destination) in staged)
+                {
+                    File.Move(tempPath, destination, overwrite);
+                    published.Add(destination);
+                }
             }
-
-            oversizedParts = createdParts
-                .Where(part => GetFileSize(part) > MaxConsolidatedPdfSizeBytes)
-                .ToArray();
-
-            if (oversizedParts.Length == 0)
+            catch
             {
-                File.Delete(pdfPath);
-                Log($"[SPLIT] {pdfPath} => {createdParts.Count} partes");
-                return;
+                if (!overwrite)
+                {
+                    foreach (var destination in published)
+                        File.Delete(destination);
+
+                    if (journalCreated)
+                        File.Delete(journalPath!);
+                }
+
+                throw;
+            }
+            finally
+            {
+                foreach (var (tempPath, _) in staged.Skip(published.Count))
+                    DeleteTemporaryFile(tempPath);
+
+                if (journalTempPath is not null)
+                    DeleteTemporaryFile(journalTempPath);
             }
 
-            Log(
-                $"[SPLIT ERRO LIMITE] {pdfPath} gerou {oversizedParts.Length} parte(s) ainda acima de 14,5 MB. Esses casos exigem recompressão/redução da página, não apenas split.");
+            if (journalCreated)
+                File.Delete(journalPath!);
+        }
+
+        static void RecoverPendingPublication(string folder, string folderName, string journalPath)
+        {
+            var names = File.ReadAllLines(journalPath);
+            var outputName = $"RT {folderName}.pdf";
+            if (names.Length < 2 || names.Where((name, index) =>
+                    !name.Equals(GetPartName(outputName, index + 1), StringComparison.Ordinal)).Any())
+            {
+                throw new InvalidDataException($"Registro de publicação inválido: {journalPath}");
+            }
+
+            var destinations = names.Select(name => Path.Combine(folder, name)).ToArray();
+            if (!destinations.All(File.Exists))
+            {
+                foreach (var destination in destinations)
+                    File.Delete(destination);
+
+                Log($"[RECUPERADO] Publicação incompleta removida em {folder}");
+            }
+
+            File.Delete(journalPath);
+        }
+
+        static void DeleteTemporaryFile(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Log($"[ERRO TEMPORÁRIO] {path} => {ex.Message}");
+            }
         }
 
         static bool TryCompressPdfToLimit(string pdfPath)
@@ -452,21 +862,24 @@ namespace ConsolidacaoDePDFs
                     continue;
                 }
 
+                var errorOutput = process.StandardError.ReadToEndAsync();
+                var standardOutput = process.StandardOutput.BaseStream.CopyToAsync(Stream.Null);
                 process.WaitForExit();
+                var error = errorOutput.GetAwaiter().GetResult();
+                standardOutput.GetAwaiter().GetResult();
 
                 if (process.ExitCode != 0 || !File.Exists(tempPath))
                 {
-                    Log($"[COMPRESS ERRO] {pdfPath} ({profile}) => {process.StandardError.ReadToEnd()}");
+                    Log($"[COMPRESS ERRO] {pdfPath} ({profile}) => {error}");
                     continue;
                 }
 
                 var originalSize = GetFileSize(pdfPath);
                 var compressedSize = GetFileSize(tempPath);
 
-                if (compressedSize < originalSize)
+                if (compressedSize > 0 && compressedSize < originalSize)
                 {
-                    File.Delete(pdfPath);
-                    File.Move(tempPath, pdfPath);
+                    File.Move(tempPath, pdfPath, overwrite: true);
                     Log($"[COMPRESS] {pdfPath} {FormatSize(originalSize)} => {FormatSize(compressedSize)} ({profile})");
                 }
                 else
@@ -527,18 +940,31 @@ namespace ConsolidacaoDePDFs
             return null;
         }
 
-        static int FindLargestPageRangeEnd(string sourcePdfPath, int startPageIndex, int lastPageIndex)
+        static int FindLargestPageRangeEnd(PdfDocument input, int startPageIndex, string candidatePath,
+            string partPath)
         {
-            var low = startPageIndex;
-            var high = lastPageIndex;
+            var lastPageIndex = input.PageCount - 1;
             var best = startPageIndex - 1;
+            var candidateEnd = startPageIndex;
+
+            // Aumenta o intervalo aos poucos para evitar gerar candidatos muito maiores que o limite.
+            while (SaveCandidateIfItFits(input, startPageIndex, candidateEnd, candidatePath, partPath))
+            {
+                best = candidateEnd;
+                if (best == lastPageIndex)
+                    return best;
+
+                var pages = best - startPageIndex + 1L;
+                candidateEnd = (int)Math.Min(lastPageIndex, startPageIndex + 2 * pages - 1);
+            }
+
+            var low = best + 1;
+            var high = candidateEnd - 1;
 
             while (low <= high)
             {
-                var mid = low + ((high - low) / 2);
-                var candidateSize = GetPageRangePdfSize(sourcePdfPath, startPageIndex, mid);
-
-                if (candidateSize <= MaxConsolidatedPdfSizeBytes)
+                var mid = low + (high - low) / 2;
+                if (SaveCandidateIfItFits(input, startPageIndex, mid, candidatePath, partPath))
                 {
                     best = mid;
                     low = mid + 1;
@@ -552,40 +978,22 @@ namespace ConsolidacaoDePDFs
             return best;
         }
 
-        static long GetPageRangePdfSize(string sourcePdfPath, int startPageIndex, int endPageIndex)
+        static bool SaveCandidateIfItFits(PdfDocument input, int first, int last, string candidatePath,
+            string partPath)
         {
-            using var stream = new MemoryStream();
-            SavePageRange(sourcePdfPath, startPageIndex, endPageIndex, stream);
-            return stream.Length;
-        }
-
-        static void SavePageRange(string sourcePdfPath, int startPageIndex, int endPageIndex, string outputPath)
-        {
-            if (File.Exists(outputPath))
+            using (var output = CreatePdfDocument())
             {
-                File.Delete(outputPath);
+                for (var index = first; index <= last; index++)
+                    output.AddPage(input.Pages[index]);
+
+                output.Save(candidatePath);
             }
 
-            using var output = CreatePdfDocument();
-            AddPages(sourcePdfPath, startPageIndex, endPageIndex, output);
-            output.Save(outputPath);
-        }
+            if (GetFileSize(candidatePath) > MaxConsolidatedPdfSizeBytes)
+                return false;
 
-        static void SavePageRange(string sourcePdfPath, int startPageIndex, int endPageIndex, Stream outputStream)
-        {
-            using var output = CreatePdfDocument();
-            AddPages(sourcePdfPath, startPageIndex, endPageIndex, output);
-            output.Save(outputStream, false);
-        }
-
-        static void AddPages(string sourcePdfPath, int startPageIndex, int endPageIndex, PdfDocument output)
-        {
-            using var input = OpenWithRetry(sourcePdfPath);
-
-            for (var pageIndex = startPageIndex; pageIndex <= endPageIndex; pageIndex++)
-            {
-                output.AddPage(input.Pages[pageIndex]);
-            }
+            File.Move(candidatePath, partPath, overwrite: true);
+            return true;
         }
 
         static PdfDocument CreatePdfDocument()
@@ -613,31 +1021,21 @@ namespace ConsolidacaoDePDFs
             return $"{bytes / 1024d / 1024d:0.00} MB";
         }
 
-        static string GetPartPath(string pdfPath, int partNumber)
+        static string GetPartName(string pdfName, int partNumber)
         {
-            var directory = Path.GetDirectoryName(pdfPath) ?? string.Empty;
-            var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(pdfPath);
-            return Path.Combine(directory, $"{fileNameWithoutExtension} - PARTE {partNumber:00}.pdf");
+            return $"{Path.GetFileNameWithoutExtension(pdfName)} - PARTE {partNumber:00}.pdf";
         }
 
-        static bool HasConsolidatedParts(string folder, string folderName)
+        static FileInfo[] GetConsolidatedParts(IEnumerable<FileInfo> files, string folderName)
         {
-            return Directory
-                .EnumerateFiles(folder, $"RT {folderName} PARTE *.pdf", SearchOption.TopDirectoryOnly)
-                .Any();
-        }
-
-        static void SplitExistingConsolidatedParts(string folder, string folderName)
-        {
-            var consolidatedParts = Directory
-                .EnumerateFiles(folder, $"RT {folderName} PARTE *.pdf", SearchOption.TopDirectoryOnly)
-                .OrderBy(f => f)
+            var currentPrefix = $"RT {folderName} - PARTE ";
+            var legacyPrefix = $"RT {folderName} PARTE ";
+            return files
+                .Where(file => IsPdf(file) &&
+                               (file.Name.StartsWith(currentPrefix, StringComparison.OrdinalIgnoreCase) ||
+                                file.Name.StartsWith(legacyPrefix, StringComparison.OrdinalIgnoreCase)))
+                .OrderBy(file => file.Name)
                 .ToArray();
-
-            foreach (var consolidatedPart in consolidatedParts)
-            {
-                SplitPdfIfNeeded(consolidatedPart);
-            }
         }
 
         static bool IsConsolidatedPdf(string file, string folderName)
@@ -654,11 +1052,11 @@ namespace ConsolidacaoDePDFs
             }
         }
 
-        static void TryAppendPdf(string file, PdfDocument output)
+        static void TryAppendPdf(string file, string? localInput, PdfDocument output)
         {
             try
             {
-                using var input = OpenWithRetry(file);
+                using var input = OpenWithRetry(file, localInput);
                 CopyPages(input, output);
             }
             catch (Exception ex)
@@ -667,21 +1065,36 @@ namespace ConsolidacaoDePDFs
             }
         }
 
-        static PdfDocument OpenWithRetry(string file, int maxRetries = 3)
+        static void CopyToLocal(string sourcePath, string localPath)
         {
-            for (int i = 0; i < maxRetries; i++)
+            using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read,
+                FileShare.Read, 1, FileOptions.SequentialScan);
+            using var target = new FileStream(localPath, FileMode.Create, FileAccess.Write, FileShare.None, 1);
+            source.CopyTo(target, 128 * 1024);
+        }
+
+        static PdfDocument OpenWithRetry(string file, string? localInput = null)
+        {
+            const int attempts = 3;
+            for (var attempt = 1; ; attempt++)
             {
                 try
                 {
-                    return PdfReader.Open(file, PdfDocumentOpenMode.Import);
+                    if (localInput is not null)
+                        CopyToLocal(file, localInput);
+
+                    return PdfReader.Open(localInput ?? file, PdfDocumentOpenMode.Import);
                 }
-                catch
+                catch (IOException ex) when (attempt < attempts && IsTransientIoError(ex))
                 {
-                    Thread.Sleep(200);
+                    Thread.Sleep(200 * attempt);
                 }
             }
+        }
 
-            throw new Exception($"Falha ao abrir PDF: {file}");
+        static bool IsTransientIoError(IOException exception)
+        {
+            return (exception.HResult & 0xffff) is 32 or 33 or 53 or 54 or 58 or 59 or 64 or 67 or 121 or 1231 or 1232 or 1236;
         }
 
         static void CopyPages(PdfDocument from, PdfDocument to)
@@ -699,7 +1112,7 @@ namespace ConsolidacaoDePDFs
             lock (_lock)
             {
                 Console.WriteLine(linha);
-                File.AppendAllText(LogPath, linha + Environment.NewLine);
+                File.AppendAllText(Path.Combine(LogFolderPath, "consolidacao_log_infos.txt"), linha + Environment.NewLine);
             }
         }
 
@@ -709,7 +1122,7 @@ namespace ConsolidacaoDePDFs
 
             lock (_lock)
             {
-                File.AppendAllText(LogPastasVaziasPath, linha + Environment.NewLine);
+                File.AppendAllText(Path.Combine(LogFolderPath, "consolidacao_log_pastas_vazias.txt"), linha + Environment.NewLine);
             }
         }
 
@@ -719,7 +1132,7 @@ namespace ConsolidacaoDePDFs
 
             lock (_lock)
             {
-                File.AppendAllText(LogJaExisteConsolidacao, linha + Environment.NewLine);
+                File.AppendAllText(Path.Combine(LogFolderPath, "consolidacao_log_ja_consolidado.txt"), linha + Environment.NewLine);
             }
         }
 

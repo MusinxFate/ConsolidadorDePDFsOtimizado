@@ -6,9 +6,10 @@ namespace SeparadorDePDFs;
 
 internal static class Program
 {
-    private const long MaxPdfSizeBytes = (long)(14.5 * 1024 * 1024);
+    private const long MaxPdfSizeBytes = (long)(10.5 * 1024 * 1024);
     private const string PartsFolderName = "PDFs partidos";
     private const string SubfoldersOption = "--subpastas";
+    private const string ParallelismOption = "--paralelismo=";
     private const string PreferredGhostscriptExecutablePath =
         @"C:\Users\murilo.souza\Downloads\ghostxps-10.07.1-win64\gxpswin64.exe";
 
@@ -26,10 +27,29 @@ internal static class Program
 
     static void Main(string[] args)
     {
-        var includeSubfolders = args.Contains(SubfoldersOption, StringComparer.OrdinalIgnoreCase);
-        var pathArgs = args
-            .Where(arg => !arg.Equals(SubfoldersOption, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
+        var includeSubfolders = false;
+        var parallelism = 10;
+        var pathArgs = new List<string>();
+        foreach (var arg in args)
+        {
+            if (arg.Equals(SubfoldersOption, StringComparison.OrdinalIgnoreCase))
+            {
+                includeSubfolders = true;
+            }
+            else if (arg.StartsWith(ParallelismOption, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!int.TryParse(arg.AsSpan(ParallelismOption.Length), out parallelism) || parallelism < 1)
+                {
+                    Log("Informe um inteiro positivo em --paralelismo=N.");
+                    return;
+                }
+            }
+            else
+            {
+                pathArgs.Add(arg);
+            }
+        }
+
         var folderPath = GetFolderPath(pathArgs);
 
         if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
@@ -45,10 +65,9 @@ internal static class Program
         }
 
         var pdfFiles = GetFoldersToScan(folderPath, includeSubfolders)
-            .SelectMany(folder => Directory.EnumerateFiles(folder, "*.pdf", SearchOption.TopDirectoryOnly))
-            .Where(HasContent)
-            .Where(file => !IsGeneratedPart(file))
-            .OrderBy(file => file)
+            .SelectMany(folder => folder.EnumerateFiles("*.pdf", SearchOption.TopDirectoryOnly))
+            .Where(file => !IsGeneratedPart(file.Name) && file.Length > 0)
+            .OrderBy(file => file.FullName)
             .ToArray();
 
         if (pdfFiles.Length == 0)
@@ -60,20 +79,28 @@ internal static class Program
         Log($"PDFs encontrados: {pdfFiles.Length}");
         Log($"Limite por parte: {FormatSize(MaxPdfSizeBytes)}");
 
-        foreach (var pdfFile in pdfFiles)
+        if (parallelism == 1)
         {
-            SplitPdfIfNeeded(pdfFile);
+            foreach (var pdfFile in pdfFiles)
+            {
+                SplitPdfIfNeeded(pdfFile);
+            }
+        }
+        else
+        {
+            Parallel.ForEach(pdfFiles, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, SplitPdfIfNeeded);
         }
 
         Log("Finalizado.");
     }
 
-    private static IEnumerable<string> GetFoldersToScan(string folderPath, bool includeSubfolders)
+    private static IEnumerable<DirectoryInfo> GetFoldersToScan(string folderPath, bool includeSubfolders)
     {
+        var root = new DirectoryInfo(folderPath);
         var selectedNames = new HashSet<string>(NomesDasPastas, StringComparer.OrdinalIgnoreCase);
         if (selectedNames.Count == 0)
         {
-            yield return folderPath;
+            yield return root;
             if (!includeSubfolders)
             {
                 yield break;
@@ -86,7 +113,7 @@ internal static class Program
             IgnoreInaccessible = false
         };
         var pendingFolders = new Stack<DirectoryInfo>();
-        pendingFolders.Push(new DirectoryInfo(folderPath));
+        pendingFolders.Push(root);
 
         while (pendingFolders.TryPop(out var folder))
         {
@@ -99,7 +126,7 @@ internal static class Program
 
                 if (selectedNames.Count == 0 || selectedNames.Contains(subfolder.Name))
                 {
-                    yield return subfolder.FullName;
+                    yield return subfolder;
                 }
 
                 if (includeSubfolders)
@@ -110,9 +137,9 @@ internal static class Program
         }
     }
 
-    private static string? GetFolderPath(string[] args)
+    private static string? GetFolderPath(List<string> args)
     {
-        if (args.Length > 0)
+        if (args.Count > 0)
         {
             return string.Join(' ', args).Trim('"');
         }
@@ -121,11 +148,12 @@ internal static class Program
         return Console.ReadLine()?.Trim().Trim('"');
     }
 
-    private static void SplitPdfIfNeeded(string pdfPath)
+    private static void SplitPdfIfNeeded(FileInfo pdfFile)
     {
+        var pdfPath = pdfFile.FullName;
         try
         {
-            var originalSize = GetFileSize(pdfPath);
+            var originalSize = pdfFile.Length;
 
             if (originalSize <= MaxPdfSizeBytes)
             {
@@ -133,35 +161,50 @@ internal static class Program
                 return;
             }
 
-            int pageCount;
-            using (var input = OpenWithRetry(pdfPath))
+            ProcessOversizedPdf(pdfFile);
+        }
+        catch (Exception ex)
+        {
+            Log($"[ERRO] {pdfPath} => {ex.Message}");
+        }
+    }
+
+    private static void ProcessOversizedPdf(FileInfo pdfFile)
+    {
+        var workspace = Directory.CreateTempSubdirectory("separador-pdf-");
+        try
+        {
+            var sourcePath = pdfFile.FullName;
+            var root = Path.GetPathRoot(sourcePath)!;
+            if (root.StartsWith(@"\\", StringComparison.Ordinal) || new DriveInfo(root).DriveType == DriveType.Network)
             {
-                pageCount = input.PageCount;
+                sourcePath = Path.Combine(workspace.FullName, pdfFile.Name);
+                File.Copy(pdfFile.FullName, sourcePath);
             }
 
+            using var input = OpenWithRetry(sourcePath);
+            var pageCount = input.PageCount;
             if (pageCount == 0)
             {
-                Log($"[VAZIO] {pdfPath}");
+                Log($"[VAZIO] {pdfFile.FullName}");
                 return;
             }
 
-            var partsFolderPath = GetPartsFolderPath(pdfPath);
-            Directory.CreateDirectory(partsFolderPath);
-            DeleteExistingParts(pdfPath, partsFolderPath);
-
+            var workingPartsFolder = workspace.FullName;
             var partNumber = 1;
             var createdParts = new List<string>();
             var startPageIndex = 0;
 
             while (startPageIndex < pageCount)
             {
-                var endPageIndex = FindLargestPageRangeEnd(pdfPath, startPageIndex, pageCount - 1);
+                var endPageIndex = FindLargestPageRangeEnd(input, sourcePath, startPageIndex, pageCount - 1);
 
                 if (endPageIndex >= startPageIndex)
                 {
                     SaveRangeOrSplitFailures(
-                        pdfPath,
-                        partsFolderPath,
+                        input,
+                        sourcePath,
+                        workingPartsFolder,
                         startPageIndex,
                         endPageIndex,
                         ref partNumber,
@@ -171,8 +214,9 @@ internal static class Program
                 }
 
                 ExtractPagesSeparately(
-                    pdfPath,
-                    partsFolderPath,
+                    input,
+                    sourcePath,
+                    workingPartsFolder,
                     startPageIndex,
                     startPageIndex,
                     ref partNumber,
@@ -190,25 +234,40 @@ internal static class Program
                 TryCompressPdfToLimit(oversizedPart);
             }
 
-            oversizedParts = createdParts
-                .Where(part => GetFileSize(part) > MaxPdfSizeBytes)
-                .ToArray();
+            var oversizedCount = oversizedParts.Count(part => GetFileSize(part) > MaxPdfSizeBytes);
 
-            if (oversizedParts.Length == 0)
+            if (createdParts.Count == 0)
             {
-                Log($"[DIVIDIDO] {Path.GetFileName(pdfPath)} => {createdParts.Count} parte(s) em {partsFolderPath}. Original mantido.");
+                Log($"[ERRO] {pdfFile.Name} => nenhuma parte foi criada.");
                 return;
             }
 
-            Log($"[ERRO LIMITE] {Path.GetFileName(pdfPath)} gerou {oversizedParts.Length} parte(s) ainda acima de 14,5 MB.");
+            var partsFolderPath = GetPartsFolderPath(pdfFile.FullName);
+            PublishParts(pdfFile.FullName, partsFolderPath, createdParts);
+
+            if (oversizedCount > 0)
+            {
+                Log($"[ERRO LIMITE] {pdfFile.Name} gerou {oversizedCount} parte(s) ainda acima de {FormatSize(MaxPdfSizeBytes)}.");
+                return;
+            }
+
+            Log($"[DIVIDIDO] {pdfFile.Name} => {createdParts.Count} parte(s) em {partsFolderPath}. Original mantido.");
         }
-        catch (Exception ex)
+        finally
         {
-            Log($"[ERRO] {pdfPath} => {ex.Message}");
+            try
+            {
+                workspace.Delete(recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Log($"[AVISO LIMPEZA] {workspace.FullName} => {ex.Message}");
+            }
         }
     }
 
     private static void SaveRangeOrSplitFailures(
+        PdfDocument input,
         string pdfPath,
         string partsFolderPath,
         int startPageIndex,
@@ -220,7 +279,7 @@ internal static class Program
 
         try
         {
-            SavePageRange(pdfPath, startPageIndex, endPageIndex, partPath);
+            SavePageRange(input, startPageIndex, endPageIndex, partPath);
             EnsureExtractedPdfHasContent(partPath, endPageIndex - startPageIndex + 1);
             createdParts.Add(partPath);
             partNumber++;
@@ -235,6 +294,7 @@ internal static class Program
         if (startPageIndex == endPageIndex)
         {
             ExtractPagesSeparately(
+                input,
                 pdfPath,
                 partsFolderPath,
                 startPageIndex,
@@ -248,6 +308,7 @@ internal static class Program
         var midPageIndex = startPageIndex + ((endPageIndex - startPageIndex) / 2);
 
         SaveRangeOrSplitFailures(
+            input,
             pdfPath,
             partsFolderPath,
             startPageIndex,
@@ -256,6 +317,7 @@ internal static class Program
             createdParts);
 
         SaveRangeOrSplitFailures(
+            input,
             pdfPath,
             partsFolderPath,
             midPageIndex + 1,
@@ -352,6 +414,7 @@ internal static class Program
     }
 
     private static void ExtractPagesSeparately(
+        PdfDocument input,
         string pdfPath,
         string partsFolderPath,
         int startPageIndex,
@@ -369,7 +432,7 @@ internal static class Program
 
             try
             {
-                SavePageRange(pdfPath, pageIndex, pageIndex, singlePagePath);
+                SavePageRange(input, pageIndex, pageIndex, singlePagePath);
                 EnsureExtractedPdfHasContent(singlePagePath, 1);
             }
             catch (Exception ex)
@@ -504,7 +567,7 @@ internal static class Program
         return null;
     }
 
-    private static int FindLargestPageRangeEnd(string sourcePdfPath, int startPageIndex, int lastPageIndex)
+    private static int FindLargestPageRangeEnd(PdfDocument input, string sourcePdfPath, int startPageIndex, int lastPageIndex)
     {
         var low = startPageIndex;
         var high = lastPageIndex;
@@ -517,7 +580,11 @@ internal static class Program
 
             try
             {
-                candidateSize = GetPageRangePdfSize(sourcePdfPath, startPageIndex, mid);
+                using var stream = new MemoryStream();
+                using var output = CreatePdfDocument();
+                AddPages(input, startPageIndex, mid, output);
+                output.Save(stream, false);
+                candidateSize = stream.Length;
             }
             catch (Exception ex)
             {
@@ -540,36 +607,15 @@ internal static class Program
         return best;
     }
 
-    private static long GetPageRangePdfSize(string sourcePdfPath, int startPageIndex, int endPageIndex)
+    private static void SavePageRange(PdfDocument input, int startPageIndex, int endPageIndex, string outputPath)
     {
-        using var stream = new MemoryStream();
-        SavePageRange(sourcePdfPath, startPageIndex, endPageIndex, stream);
-        return stream.Length;
-    }
-
-    private static void SavePageRange(string sourcePdfPath, int startPageIndex, int endPageIndex, string outputPath)
-    {
-        if (File.Exists(outputPath))
-        {
-            File.Delete(outputPath);
-        }
-
         using var output = CreatePdfDocument();
-        AddPages(sourcePdfPath, startPageIndex, endPageIndex, output);
+        AddPages(input, startPageIndex, endPageIndex, output);
         output.Save(outputPath);
     }
 
-    private static void SavePageRange(string sourcePdfPath, int startPageIndex, int endPageIndex, Stream outputStream)
+    private static void AddPages(PdfDocument input, int startPageIndex, int endPageIndex, PdfDocument output)
     {
-        using var output = CreatePdfDocument();
-        AddPages(sourcePdfPath, startPageIndex, endPageIndex, output);
-        output.Save(outputStream, false);
-    }
-
-    private static void AddPages(string sourcePdfPath, int startPageIndex, int endPageIndex, PdfDocument output)
-    {
-        using var input = OpenWithRetry(sourcePdfPath);
-
         for (var pageIndex = startPageIndex; pageIndex <= endPageIndex; pageIndex++)
         {
             output.AddPage(input.Pages[pageIndex]);
@@ -634,13 +680,51 @@ internal static class Program
         return Path.Combine(directory, PartsFolderName);
     }
 
-    private static void DeleteExistingParts(string pdfPath, string partsFolderPath)
+    private static void PublishParts(string pdfPath, string partsFolderPath, List<string> createdParts)
     {
-        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(pdfPath);
+        Directory.CreateDirectory(partsFolderPath);
+        var pendingParts = new List<(string TemporaryPath, string FinalPath)>(createdParts.Count);
+        var publishedCount = 0;
 
-        foreach (var partPath in Directory.EnumerateFiles(partsFolderPath, $"{fileNameWithoutExtension} - parte *.pdf", SearchOption.TopDirectoryOnly))
+        try
         {
-            File.Delete(partPath);
+            foreach (var partPath in createdParts)
+            {
+                var temporaryPath = Path.Combine(partsFolderPath, $".{Guid.NewGuid():N}.tmp");
+                var finalPath = Path.Combine(partsFolderPath, Path.GetFileName(partPath));
+                pendingParts.Add((temporaryPath, finalPath));
+                File.Copy(partPath, temporaryPath);
+            }
+
+            foreach (var (temporaryPath, finalPath) in pendingParts)
+            {
+                File.Move(temporaryPath, finalPath, overwrite: true);
+                publishedCount++;
+            }
+
+            var publishedPaths = pendingParts.Select(part => part.FinalPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var pattern = $"{Path.GetFileNameWithoutExtension(pdfPath)} - parte *.pdf";
+            foreach (var existingPart in Directory.EnumerateFiles(partsFolderPath, pattern, SearchOption.TopDirectoryOnly))
+            {
+                if (!publishedPaths.Contains(existingPart))
+                {
+                    File.Delete(existingPart);
+                }
+            }
+        }
+        finally
+        {
+            foreach (var (temporaryPath, _) in pendingParts.Skip(publishedCount))
+            {
+                try
+                {
+                    File.Delete(temporaryPath);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    Log($"[AVISO LIMPEZA] {temporaryPath} => {ex.Message}");
+                }
+            }
         }
     }
 
@@ -668,19 +752,6 @@ internal static class Program
     {
         var fileName = Path.GetFileNameWithoutExtension(file);
         return fileName.Contains(" - parte ", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool HasContent(string file)
-    {
-        try
-        {
-            return GetFileSize(file) > 0;
-        }
-        catch (Exception ex)
-        {
-            Log($"[ERRO TAMANHO] {file} => {ex.Message}");
-            return false;
-        }
     }
 
     private static long GetFileSize(string filePath)
