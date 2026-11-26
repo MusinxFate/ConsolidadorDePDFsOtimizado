@@ -60,7 +60,7 @@ internal static class Program
 
         if (args.Length == 0)
         {
-            Console.Write("Verificar subpastas em todos os níveis? (s/N): ");
+            Console.Write("Verificar subpastas em todos os níveis? (S/N): ");
             includeSubfolders = string.Equals(Console.ReadLine()?.Trim(), "s", StringComparison.OrdinalIgnoreCase);
         }
 
@@ -144,7 +144,7 @@ internal static class Program
             return string.Join(' ', args).Trim('"');
         }
 
-        Console.Write("Informe a pasta onde estao os PDFs: ");
+        Console.Write("Informe o caminho da pasta onde estão os PDFs: ");
         return Console.ReadLine()?.Trim().Trim('"');
     }
 
@@ -157,7 +157,7 @@ internal static class Program
 
             if (originalSize <= MaxPdfSizeBytes)
             {
-                Log($"[OK] {Path.GetFileName(pdfPath)} ja esta dentro do limite ({FormatSize(originalSize)}).");
+                Log($"[OK] {Path.GetFileName(pdfPath)} já está dentro do limite ({FormatSize(originalSize)}).");
                 return;
             }
 
@@ -337,7 +337,7 @@ internal static class Program
 
         if (ghostscriptPath is null)
         {
-            Log($"[COMPRESS SKIP] Ghostscript nao encontrado. Arquivo: {pdfPath}");
+            Log($"[COMPRESS SKIP] Ghostscript não encontrado. Arquivo: {pdfPath}");
             return false;
         }
 
@@ -560,7 +560,7 @@ internal static class Program
 
         if (File.Exists(PreferredGhostscriptExecutablePath))
         {
-            Log($"[GS AVISO] Usando {PreferredGhostscriptExecutablePath}, mas esse executavel e GhostXPS e pode nao ler PDF de entrada.");
+            Log($"[GS AVISO] Usando {PreferredGhostscriptExecutablePath}, mas esse executável é GhostXPS e pode não ler PDF de entrada.");
             return PreferredGhostscriptExecutablePath;
         }
 
@@ -653,14 +653,14 @@ internal static class Program
     {
         if (!File.Exists(pdfPath) || GetFileSize(pdfPath) == 0)
         {
-            throw new InvalidOperationException("PDF extraido nao foi criado ou ficou com 0 bytes.");
+            throw new InvalidOperationException("PDF extraído não foi criado ou ficou com 0 bytes.");
         }
 
         using var document = PdfReader.Open(pdfPath, PdfDocumentOpenMode.Import);
 
         if (document.PageCount != expectedPageCount)
         {
-            throw new InvalidOperationException($"PDF extraido ficou com {document.PageCount} pagina(s), esperado {expectedPageCount}.");
+            throw new InvalidOperationException($"PDF extraído ficou com {document.PageCount} página(s), esperado {expectedPageCount}.");
         }
 
         for (var pageIndex = 0; pageIndex < document.PageCount; pageIndex++)
@@ -669,7 +669,7 @@ internal static class Program
 
             if (page.Contents.Elements.Count == 0)
             {
-                throw new InvalidOperationException($"Pagina {pageIndex + 1} do PDF extraido ficou sem stream de conteudo.");
+                throw new InvalidOperationException($"Página {pageIndex + 1} do PDF extraído ficou sem stream de conteúdo.");
             }
         }
     }
